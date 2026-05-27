@@ -200,8 +200,10 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
     for (const contact of rawContacts) {
       if (!contact.phone) continue;
       
-      // Keep only digits
-      let cleanPhone = contact.phone.toString().replace(/[^0-9]/g, '');
+      // Smart sanitize: remove separator characters (spaces, hyphens, parentheses), then extract leading digits
+      let phoneStr = contact.phone.toString().replace(/[\s\-\(\)]+/g, '');
+      const match = phoneStr.match(/^\+?[0-9]+/);
+      let cleanPhone = match ? match[0].replace(/[^0-9]/g, '') : phoneStr.replace(/[^0-9]/g, '');
       if (cleanPhone.length < 8) continue; // invalid number filter: must be at least 8 digits
 
       // Remove duplicates

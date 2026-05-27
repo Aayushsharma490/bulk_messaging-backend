@@ -32,12 +32,23 @@ function isClientReady(sessionId) {
 }
 
 // Initialize all saved sessions from DB on startup
+// Initialize all saved sessions from DB on startup (only restore active CONNECTED ones to save memory)
 async function initSessions() {
   const sessions = await db.getSessions();
   for (const session of sessions) {
-    console.log(`Restoring session: ${session.name} (${session.id})`);
-    // If the session was connected/connecting, let's auto-reconnect it
-    await startSession(session.id);
+    if (session.status === 'CONNECTED') {
+      console.log(`Restoring active session: ${session.name} (${session.id})`);
+      await startSession(session.id);
+    } else {
+      console.log(`Skipping restore for offline session: ${session.name} (${session.id})`);
+      // Reset any stuck states (like CONNECTING or QR_READY) to DISCONNECTED
+      if (session.status !== 'DISCONNECTED') {
+        session.status = 'DISCONNECTED';
+        session.qrCode = null;
+        session.phoneNumber = '';
+        await db.saveSession(session);
+      }
+    }
   }
 }
 
