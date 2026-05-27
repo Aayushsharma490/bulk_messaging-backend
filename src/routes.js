@@ -232,7 +232,7 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
     const campaignId = 'camp_' + Math.random().toString(36).substring(2, 9);
     const isScheduled = !!scheduledAt;
 
-    // 3. Create campaign object
+    // 3. Create campaign object (Safety limits hardcoded on backend)
     const campaign = {
       id: campaignId,
       name,
@@ -241,10 +241,10 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
       templates,
       status: isScheduled ? 'scheduled' : 'running',
       scheduledAt: isScheduled ? scheduledAt : null,
-      batchSize: parseInt(batchSize, 10) || 200,
-      batchCooldown: parseInt(batchCooldown, 10) || 300,
-      minDelay: parseInt(minDelay, 10) || 20,
-      maxDelay: parseInt(maxDelay, 10) || 45,
+      batchSize: 200, // Hardcoded safe batch size
+      batchCooldown: 300, // Hardcoded 5 minutes cooldown
+      minDelay: 5, // Hardcoded 5 seconds minimum delay
+      maxDelay: 20, // Hardcoded 20 seconds maximum delay
       media,
       totalContacts: processedContacts.length,
       createdAt: new Date().toISOString()
