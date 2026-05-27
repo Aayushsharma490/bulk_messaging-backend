@@ -195,13 +195,38 @@ async function sendSingleMessage(campaign, message, client) {
     // 1. Sanitize and format the phone number
     let cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
     
-    // Auto-prefix logic: if number doesn't have country code (e.g. length is 10), we can assume +91 or warn.
-    // However, we assume the user imports clean numbers with country codes.
-    // Let's ensure it has @c.us at the end
+    // Auto-prefix logic: ensure we have @c.us JID format
     if (!cleanNumber.endsWith('@c.us')) {
       cleanNumber = `${cleanNumber}@c.us`;
     }
 
+    // 2. Validate if number is registered on WhatsApp (essential to prevent Puppeteer hanging on unregistered numbers)
+    let targetJid = cleanNumber;
+    try {
+      const numberOnly = cleanNumber.split('@')[0];
+      const numberId = await withTimeout(
+        client.getNumberId(numberOnly),
+        10000,
+        'WhatsApp registration check timed out'
+      );
+      
+      if (!numberId) {
+        console.log(`Number ${numberOnly} is not registered on WhatsApp.`);
+        await db.updateMessageStatus(message.id, 'failed', 'Unregistered WhatsApp number');
+        await db.addLog(campaignId, 'error', `Failed to send to ${message.name || message.phoneNumber}: Number not registered on WhatsApp`);
+        
+        campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
+        await db.saveCampaign(campaign);
+        
+        emitToSocket('message_status', { messageId: message.id, status: 'failed', campaignId });
+        return;
+      }
+      
+      targetJid = numberId._serialized;
+    } catch (err) {
+      console.warn(`Registration check failed/timed out for ${message.phoneNumber}, falling back to direct send:`, err.message);
+      // Fallback: proceed with default cleanNumber
+    }
 
     // 3. Format message content
     // Personalized variables: Replace {name} or any custom field
@@ -215,7 +240,7 @@ async function sendSingleMessage(campaign, message, client) {
       }
     }
 
-    // 4. Send Message (with or without media) - Wrapped in 25s/30s timeout to prevent hanging
+    // 4. Send Message (with or without media) - Wrapped in safety timeouts
     if (campaign.media && campaign.media.filename) {
       // Media path
       const mediaPath = path.join(__dirname, '..', 'uploads', campaign.media.filename);
@@ -225,8 +250,8 @@ async function sendSingleMessage(campaign, message, client) {
         const media = new MessageMedia(campaign.media.mimeType, base64Data, campaign.media.filename);
         
         await withTimeout(
-          client.sendMessage(cleanNumber, media, { caption: formattedText }),
-          90000,
+          client.sendMessage(targetJid, media, { caption: formattedText }),
+          60000,
           'Media message send timed out'
         );
       } catch (err) {
@@ -235,8 +260,8 @@ async function sendSingleMessage(campaign, message, client) {
       }
     } else {
       await withTimeout(
-        client.sendMessage(cleanNumber, formattedText),
-        40000,
+        client.sendMessage(targetJid, formattedText),
+        25000,
         'Message send timed out'
       );
     }
