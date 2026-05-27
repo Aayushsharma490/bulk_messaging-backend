@@ -202,24 +202,6 @@ async function sendSingleMessage(campaign, message, client) {
       cleanNumber = `${cleanNumber}@c.us`;
     }
 
-    // 2. Validate WhatsApp registration (Wrapped in 15s timeout to prevent hanging)
-    const isRegistered = await withTimeout(
-      client.isRegisteredUser(cleanNumber), 
-      15000, 
-      'WhatsApp check timed out'
-    );
-    
-    if (!isRegistered) {
-      await db.updateMessageStatus(message.id, 'failed', 'Invalid number (not registered on WhatsApp)');
-      await db.addLog(campaignId, 'error', `Failed to send to ${message.name}: Number is not registered on WhatsApp.`);
-      
-      // Update campaign counters
-      campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
-      await db.saveCampaign(campaign);
-      
-      emitToSocket('message_status', { messageId: message.id, status: 'failed', campaignId });
-      return;
-    }
 
     // 3. Format message content
     // Personalized variables: Replace {name} or any custom field
