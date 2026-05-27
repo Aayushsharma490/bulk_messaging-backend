@@ -145,9 +145,9 @@ async function processQueue() {
 async function sendSingleMessage(campaign, message, client) {
   const campaignId = campaign.id;
   
-  // Set random delay: 20-45 seconds
-  const minDelay = campaign.minDelay || 20;
-  const maxDelay = campaign.maxDelay || 45;
+  // Set random delay: 5-15 seconds
+  const minDelay = campaign.minDelay || 5;
+  const maxDelay = campaign.maxDelay || 15;
   const delaySeconds = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
 
   console.log(`Sending message ${message.id} to ${message.phoneNumber} in ${delaySeconds} seconds.`);
@@ -240,6 +240,24 @@ async function sendSingleMessage(campaign, message, client) {
     emitToSocket('message_status', { messageId: message.id, status: 'sent', campaignId });
   } catch (err) {
     console.error(`Failed to send message ${message.id}:`, err);
+    
+    // Check for temporary browser context reloads or CDP disconnects
+    const errMsg = err.message || '';
+    const isTempBrowserIssue = 
+      errMsg.includes('Protocol error') || 
+      errMsg.includes('context was destroyed') || 
+      errMsg.includes('Session closed') ||
+      errMsg.includes('browser has already been closed') ||
+      errMsg.includes('Target closed') ||
+      errMsg.includes('Network.enable');
+
+    if (isTempBrowserIssue) {
+      console.log(`Temporary browser issue detected, keeping message ${message.id} as pending to retry...`);
+      await db.addLog(campaignId, 'error', `Connection hiccup: Browser context was reset. Retrying send to ${message.name || message.phoneNumber} shortly...`);
+      // Return without updating DB status to failed, preserving it as pending
+      return;
+    }
+
     await db.updateMessageStatus(message.id, 'failed', err.message || 'Unknown sending error');
     await db.addLog(campaignId, 'error', `Failed to send to ${message.name}: ${err.message}`);
     
