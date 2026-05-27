@@ -201,6 +201,14 @@ const db = {
 
     await writeDb(data);
     return newLog;
+  },
+
+  async resetDb() {
+    const data = await readDb();
+    data.campaigns = [];
+    data.messages = [];
+    data.logs = [];
+    await writeDb(data);
   }
 };
 

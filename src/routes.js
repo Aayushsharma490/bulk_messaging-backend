@@ -366,4 +366,24 @@ function fileMimeType(filename) {
   return mimeTypes[ext];
 }
 
+// --- ADMIN RESET ROUTE ---
+// Reset database (clear campaigns, messages, logs but keep active sessions)
+router.get('/admin/reset', async (req, res) => {
+  try {
+    await db.resetDb();
+    res.send('<h1>Database Reset Successful</h1><p>All campaigns, messages, and logs have been cleared. Connected sessions remain active.</p>');
+  } catch (err) {
+    res.status(500).send(`<h1>Database Reset Failed</h1><p>${err.message}</p>`);
+  }
+});
+
+router.post('/admin/reset', async (req, res) => {
+  try {
+    await db.resetDb();
+    res.json({ success: true, message: 'Database reset successfully (campaigns, messages, and logs cleared).' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
