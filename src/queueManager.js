@@ -206,7 +206,7 @@ async function sendSingleMessage(campaign, message, client) {
       const numberOnly = cleanNumber.split('@')[0];
       const numberId = await withTimeout(
         client.getNumberId(numberOnly),
-        10000,
+        15000,
         'WhatsApp registration check timed out'
       );
       

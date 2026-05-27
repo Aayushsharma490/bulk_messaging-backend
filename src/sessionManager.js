@@ -93,13 +93,11 @@ async function startSession(sessionId) {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process', // Runs in a single process to reduce memory footprint on restricted containers
         '--disable-gpu',
         '--disable-extensions',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
-        '--disable-background-timer-throttling',
-        '--disable-ipc-flooding-protection'
+        '--disable-background-timer-throttling'
       ]
     }
   });
