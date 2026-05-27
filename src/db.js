@@ -134,6 +134,14 @@ const db = {
     return campaign;
   },
 
+  async deleteCampaign(id) {
+    const data = await readDb();
+    data.campaigns = data.campaigns.filter(c => c.id !== id);
+    data.messages = data.messages.filter(m => m.campaignId !== id);
+    data.logs = data.logs.filter(l => l.campaignId !== id);
+    await writeDb(data);
+  },
+
   // --- MESSAGES ---
   async getMessages(campaignId) {
     const data = await readDb();

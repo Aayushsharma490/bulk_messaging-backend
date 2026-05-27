@@ -325,6 +325,16 @@ router.post('/campaigns/:id/stop', async (req, res) => {
   }
 });
 
+// Delete Campaign
+router.delete('/campaigns/:id', async (req, res) => {
+  try {
+    await db.deleteCampaign(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get Messages for a campaign
 router.get('/campaigns/:id/messages', async (req, res) => {
   try {
