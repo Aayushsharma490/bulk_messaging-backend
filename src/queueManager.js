@@ -226,7 +226,7 @@ async function sendSingleMessage(campaign, message, client) {
         
         await withTimeout(
           client.sendMessage(cleanNumber, media, { caption: formattedText }),
-          30000,
+          90000,
           'Media message send timed out'
         );
       } catch (err) {
@@ -236,7 +236,7 @@ async function sendSingleMessage(campaign, message, client) {
     } else {
       await withTimeout(
         client.sendMessage(cleanNumber, formattedText),
-        20000,
+        40000,
         'Message send timed out'
       );
     }
@@ -261,11 +261,13 @@ async function sendSingleMessage(campaign, message, client) {
       errMsg.includes('Session closed') ||
       errMsg.includes('browser has already been closed') ||
       errMsg.includes('Target closed') ||
-      errMsg.includes('Network.enable');
+      errMsg.includes('Network.enable') ||
+      errMsg.includes('timed out') ||
+      errMsg.includes('timeout');
 
     if (isTempBrowserIssue) {
       console.log(`Temporary browser issue detected, keeping message ${message.id} as pending to retry...`);
-      await db.addLog(campaignId, 'error', `Connection hiccup: Browser context was reset. Retrying send to ${message.name || message.phoneNumber} shortly...`);
+      await db.addLog(campaignId, 'error', `Connection hiccup: Browser context was reset or timed out. Retrying send to ${message.name || message.phoneNumber} shortly...`);
       // Return without updating DB status to failed, preserving it as pending
       return;
     }
