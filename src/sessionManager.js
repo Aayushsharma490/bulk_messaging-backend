@@ -1,4 +1,6 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const makeWASocket = require('@whiskeysockets/baileys').default;
+const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const QRCode = require('qrcode');
 const path = require('path');
 const fs = require('fs').promises;
@@ -7,7 +9,7 @@ const db = require('./db');
 const clients = {};
 let socketIo = null;
 
-const AUTH_PATH = path.join(__dirname, '..', '.wwebjs_auth');
+const AUTH_PATH = path.join(__dirname, '..', 'data', 'sessions_baileys');
 
 function setSocketIo(io) {
   socketIo = io;
@@ -27,12 +29,11 @@ function getClient(sessionId) {
 
 // Check if a client is ready
 function isClientReady(sessionId) {
-  const client = clients[sessionId];
-  return client && client.info && client.info.wid;
+  const sock = clients[sessionId];
+  return sock && sock.user && sock.user.id;
 }
 
 // Initialize all saved sessions from DB on startup
-// Initialize all saved sessions from DB on startup (only restore active CONNECTED ones to save memory)
 async function initSessions() {
   const sessions = await db.getSessions();
   for (const session of sessions) {
@@ -76,113 +77,118 @@ async function startSession(sessionId) {
   await db.saveSession(sessionData);
   emitToSocket('session_update', sessionData);
 
-  const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: sessionId,
-      dataPath: AUTH_PATH
-    }),
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1040199739-alpha.html'
-    },
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      protocolTimeout: 180000, // 3 minutes timeout to prevent CDP connection crashes under CPU load
-      // Optimized flags for headless environments, prevents throttling and resource freezes
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-background-timer-throttling',
-        '--blink-settings=imagesEnabled=false',
-        '--js-flags=--max-old-space-size=512'
-      ]
-    }
-  });
+  const sessionAuthPath = path.join(AUTH_PATH, `session-${sessionId}`);
+  
+  try {
+    await fs.mkdir(AUTH_PATH, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(sessionAuthPath);
 
-  clients[sessionId] = client;
+    const sock = makeWASocket({
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+      defaultQueryTimeoutMs: 60000,
+      connectTimeoutMs: 60000
+    });
 
-  client.on('qr', async (qr) => {
-    try {
-      console.log(`QR received for session ${sessionId}`);
-      const qrImageUrl = await QRCode.toDataURL(qr);
+    clients[sessionId] = sock;
+
+    // Save credentials whenever they are updated
+    sock.ev.on('creds.update', saveCreds);
+
+    // Connection updates (including QR code emission and login status)
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
       
-      sessionData.status = 'QR_READY';
-      sessionData.qrCode = qrImageUrl;
-      await db.saveSession(sessionData);
-      
-      emitToSocket('session_update', sessionData);
-    } catch (err) {
-      console.error('Error generating QR code image:', err);
-    }
-  });
+      // Reload session state from DB to avoid overwriting concurrent changes
+      sessionData = await db.getSession(sessionId) || sessionData;
 
-  client.on('ready', async () => {
-    console.log(`Client is ready for session ${sessionId}`);
-    const phoneNumber = client.info.wid.user;
-    
-    sessionData.status = 'CONNECTED';
-    sessionData.qrCode = null;
-    sessionData.phoneNumber = phoneNumber;
-    await db.saveSession(sessionData);
-    
-    emitToSocket('session_update', sessionData);
-  });
+      if (qr) {
+        try {
+          console.log(`QR received for session ${sessionId}`);
+          const qrImageUrl = await QRCode.toDataURL(qr);
+          
+          sessionData.status = 'QR_READY';
+          sessionData.qrCode = qrImageUrl;
+          await db.saveSession(sessionData);
+          
+          emitToSocket('session_update', sessionData);
+        } catch (err) {
+          console.error(`Error generating QR code for session ${sessionId}:`, err);
+        }
+      }
 
-  client.on('authenticated', () => {
-    console.log(`Session ${sessionId} authenticated successfully.`);
-  });
+      if (connection === 'open') {
+        console.log(`Client is ready for session ${sessionId}`);
+        
+        // Extract phone number from sock.user.id (e.g. "917727038430:2@s.whatsapp.net" or "917727038430@s.whatsapp.net")
+        const phoneNumber = sock.user.id.split(':')[0].split('@')[0];
+        
+        sessionData.status = 'CONNECTED';
+        sessionData.qrCode = null;
+        sessionData.phoneNumber = phoneNumber;
+        await db.saveSession(sessionData);
+        
+        emitToSocket('session_update', sessionData);
+      }
 
-  client.on('auth_failure', async (msg) => {
-    console.error(`Auth failure for session ${sessionId}:`, msg);
-    
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        
+        console.log(`Session ${sessionId} connection closed. Code: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+
+        if (shouldReconnect) {
+          // Restart session connection
+          delete clients[sessionId];
+          setTimeout(() => {
+            startSession(sessionId).catch(err => {
+              console.error(`Error reconnecting session ${sessionId}:`, err);
+            });
+          }, 3000);
+        } else {
+          // Explicit logout: clean credentials and mark disconnected
+          console.log(`Session ${sessionId} was logged out.`);
+          
+          sessionData.status = 'DISCONNECTED';
+          sessionData.qrCode = null;
+          sessionData.phoneNumber = '';
+          await db.saveSession(sessionData);
+          
+          emitToSocket('session_update', sessionData);
+          
+          await destroyClient(sessionId);
+          
+          // Delete auth directory
+          try {
+            await fs.rm(sessionAuthPath, { recursive: true, force: true });
+            console.log(`Deleted credentials folder for session ${sessionId} after logout`);
+          } catch (e) {
+            console.error(`Error deleting credentials directory for logged out session ${sessionId}:`, e);
+          }
+        }
+      }
+    });
+
+    return sock;
+  } catch (err) {
+    console.error(`Error starting Baileys connection for session ${sessionId}:`, err);
     sessionData.status = 'DISCONNECTED';
-    sessionData.qrCode = null;
-    await db.saveSession(sessionData);
-    
-    emitToSocket('session_update', sessionData);
-    destroyClient(sessionId);
-  });
-
-  client.on('disconnected', async (reason) => {
-    console.log(`Session ${sessionId} was disconnected:`, reason);
-    
-    sessionData.status = 'DISCONNECTED';
-    sessionData.qrCode = null;
-    sessionData.phoneNumber = '';
-    await db.saveSession(sessionData);
-    
-    emitToSocket('session_update', sessionData);
-    destroyClient(sessionId);
-  });
-
-  // Handle initialization errors cleanly
-  client.initialize().catch(async (err) => {
-    console.error(`Error initializing client for ${sessionId}:`, err);
-    sessionData.status = 'DISCONNECTED';
     await db.saveSession(sessionData);
     emitToSocket('session_update', sessionData);
-    destroyClient(sessionId);
-  });
-
-  return client;
+    delete clients[sessionId];
+    throw err;
+  }
 }
 
 // Clean up references and memory
 async function destroyClient(sessionId) {
-  const client = clients[sessionId];
-  if (client) {
+  const sock = clients[sessionId];
+  if (sock) {
     try {
-      await client.destroy();
+      sock.end(undefined); // Close connection cleanly without logging out
     } catch (e) {
-      console.error('Error destroying client:', e);
+      console.error(`Error ending connection for session ${sessionId}:`, e);
     }
     delete clients[sessionId];
   }
@@ -190,7 +196,19 @@ async function destroyClient(sessionId) {
 
 // Disconnect and remove all credentials
 async function removeSession(sessionId) {
-  await destroyClient(sessionId);
+  const sock = clients[sessionId];
+  if (sock) {
+    try {
+      await sock.logout();
+    } catch (e) {
+      console.error(`Error logging out session ${sessionId}:`, e);
+      try {
+        sock.end(undefined);
+      } catch (_) {}
+    }
+    delete clients[sessionId];
+  }
+  
   await db.deleteSession(sessionId);
   emitToSocket('session_deleted', { id: sessionId });
 

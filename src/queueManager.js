@@ -1,6 +1,5 @@
 const db = require('./db');
 const sessionManager = require('./sessionManager');
-const { MessageMedia } = require('whatsapp-web.js');
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -195,13 +194,11 @@ async function sendSingleMessage(campaign, message, client) {
     // 1. Sanitize and format the phone number
     let cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
     
-    // Auto-prefix logic: ensure we have @c.us JID format
-    if (!cleanNumber.endsWith('@c.us')) {
-      cleanNumber = `${cleanNumber}@c.us`;
+    // Auto-prefix logic: ensure we have @s.whatsapp.net JID format for Baileys
+    let targetJid = cleanNumber;
+    if (!targetJid.endsWith('@s.whatsapp.net')) {
+      targetJid = `${targetJid}@s.whatsapp.net`;
     }
-
-    // 2. Direct JID assignment (bypassing the unstable getNumberId check)
-    const targetJid = cleanNumber;
 
     // 3. Format message content
     // Personalized variables: Replace {name} or any custom field
@@ -221,11 +218,28 @@ async function sendSingleMessage(campaign, message, client) {
       const mediaPath = path.join(__dirname, '..', 'uploads', campaign.media.filename);
       try {
         const fileBuffer = await fs.readFile(mediaPath);
-        const base64Data = fileBuffer.toString('base64');
-        const media = new MessageMedia(campaign.media.mimeType, base64Data, campaign.media.filename);
         
+        let mediaContent;
+        const mimeType = campaign.media.mimeType || '';
+        
+        if (mimeType.startsWith('image/')) {
+          mediaContent = { image: fileBuffer, caption: formattedText };
+        } else if (mimeType.startsWith('video/')) {
+          mediaContent = { video: fileBuffer, caption: formattedText };
+        } else if (mimeType.startsWith('audio/')) {
+          mediaContent = { audio: fileBuffer, caption: formattedText };
+        } else {
+          // Send as document
+          mediaContent = { 
+            document: fileBuffer, 
+            mimetype: mimeType, 
+            fileName: campaign.media.originalName || campaign.media.filename, 
+            caption: formattedText 
+          };
+        }
+
         await withTimeout(
-          client.sendMessage(targetJid, media, { caption: formattedText }),
+          client.sendMessage(targetJid, mediaContent),
           60000,
           'Media message send timed out'
         );
@@ -235,7 +249,7 @@ async function sendSingleMessage(campaign, message, client) {
       }
     } else {
       await withTimeout(
-        client.sendMessage(targetJid, formattedText),
+        client.sendMessage(targetJid, { text: formattedText }),
         25000,
         'Message send timed out'
       );
@@ -253,7 +267,7 @@ async function sendSingleMessage(campaign, message, client) {
   } catch (err) {
     console.error(`Failed to send message ${message.id}:`, err);
     
-    // Check for temporary browser context reloads or CDP disconnects
+    // Check for temporary connection closed or WebSocket timeouts
     const errMsg = err.message || '';
     const isTempBrowserIssue = 
       errMsg.includes('Protocol error') || 
@@ -263,11 +277,15 @@ async function sendSingleMessage(campaign, message, client) {
       errMsg.includes('Target closed') ||
       errMsg.includes('Network.enable') ||
       errMsg.includes('timed out') ||
-      errMsg.includes('timeout');
+      errMsg.includes('timeout') ||
+      errMsg.includes('WebSocket') ||
+      errMsg.includes('closed') ||
+      errMsg.includes('disconnect') ||
+      errMsg.includes('stream error');
 
     if (isTempBrowserIssue) {
-      console.log(`Temporary browser issue detected, keeping message ${message.id} as pending to retry...`);
-      await db.addLog(campaignId, 'error', `Connection hiccup: Browser context was reset or timed out. Retrying send to ${message.name || message.phoneNumber} shortly...`);
+      console.log(`Temporary connection issue detected, keeping message ${message.id} as pending to retry...`);
+      await db.addLog(campaignId, 'error', `Connection hiccup: WhatsApp WebSocket was reset or timed out. Retrying send to ${message.name || message.phoneNumber} shortly...`);
       // Return without updating DB status to failed, preserving it as pending
       return;
     }
