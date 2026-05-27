@@ -57,6 +57,9 @@ async function writeDb(data) {
       console.error('Failed to write database atomically in background:', err);
     } finally {
       isWriting = false;
+      if (pendingWriteData !== null) {
+        writeDb(pendingWriteData);
+      }
     }
   });
 }

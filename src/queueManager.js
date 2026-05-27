@@ -224,8 +224,8 @@ async function sendSingleMessage(campaign, message, client) {
       
       targetJid = numberId._serialized;
     } catch (err) {
-      console.warn(`Registration check failed/timed out for ${message.phoneNumber}, falling back to direct send:`, err.message);
-      // Fallback: proceed with default cleanNumber
+      console.warn(`Registration check failed/timed out for ${message.phoneNumber}:`, err.message);
+      throw err;
     }
 
     // 3. Format message content

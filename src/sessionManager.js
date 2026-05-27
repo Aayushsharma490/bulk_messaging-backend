@@ -81,6 +81,10 @@ async function startSession(sessionId) {
       clientId: sessionId,
       dataPath: AUTH_PATH
     }),
+    webVersionCache: {
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1040199739-alpha.html'
+    },
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -92,12 +96,13 @@ async function startSession(sessionId) {
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
-        '--no-zygote',
         '--disable-gpu',
         '--disable-extensions',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
-        '--disable-background-timer-throttling'
+        '--disable-background-timer-throttling',
+        '--blink-settings=imagesEnabled=false',
+        '--js-flags=--max-old-space-size=512'
       ]
     }
   });
