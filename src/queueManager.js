@@ -27,6 +27,9 @@ let isProcessing = false;
 // Track active timers for quick interrupts
 const activeCampaignSleeps = {};
 
+// Track reconnect retry count per running campaign
+const campaignReconnectRetries = {};
+
 function setSocketIo(io) {
   socketIo = io;
 }
@@ -110,13 +113,41 @@ async function processQueue() {
     const isReady = sessionManager.isClientReady(sessionId);
 
     if (!client || !isReady) {
-      console.log(`Session ${sessionId} is not ready for campaign ${campaign.id}`);
-      campaign.status = 'paused';
-      await db.saveCampaign(campaign);
-      await db.addLog(campaign.id, 'error', `Campaign paused: WhatsApp session "${sessionId}" is disconnected.`);
-      emitToSocket('campaign_update', campaign);
-      continue;
+      const session = await db.getSession(sessionId);
+      const isExplicitlyDisconnected = !session || session.status === 'DISCONNECTED';
+      
+      if (isExplicitlyDisconnected) {
+        console.log(`Session ${sessionId} is disconnected. Pausing campaign ${campaign.id}`);
+        campaign.status = 'paused';
+        await db.saveCampaign(campaign);
+        await db.addLog(campaign.id, 'error', `Campaign paused: WhatsApp session "${session?.name || sessionId}" is disconnected.`);
+        emitToSocket('campaign_update', campaign);
+        continue;
+      }
+      
+      // Temporary reconnect grace period (10 loops = 30 seconds max)
+      const retries = campaignReconnectRetries[campaign.id] || 0;
+      if (retries < 10) {
+        campaignReconnectRetries[campaign.id] = retries + 1;
+        console.log(`Session ${sessionId} socket temporarily down. Grace retry ${retries + 1}/10 for campaign ${campaign.id}`);
+        
+        if (retries === 0) {
+          await db.addLog(campaign.id, 'info', `WhatsApp connection dropped. Attempting to auto-reconnect...`);
+        }
+        continue; // Skip this worker loop tick to wait for reconnect
+      } else {
+        // Exceeded grace period
+        delete campaignReconnectRetries[campaign.id];
+        campaign.status = 'paused';
+        await db.saveCampaign(campaign);
+        await db.addLog(campaign.id, 'error', `Campaign paused: WhatsApp session "${session?.name || sessionId}" failed to reconnect within 30 seconds.`);
+        emitToSocket('campaign_update', campaign);
+        continue;
+      }
     }
+    
+    // Connection successful, reset retry counter
+    delete campaignReconnectRetries[campaign.id];
 
     // Get pending messages for this campaign
     const messages = await db.getMessages(campaign.id);
@@ -268,20 +299,22 @@ async function sendSingleMessage(campaign, message, client) {
     console.error(`Failed to send message ${message.id}:`, err);
     
     // Check for temporary connection closed or WebSocket timeouts
-    const errMsg = err.message || '';
+    const errMsg = (err.message || '').toLowerCase();
     const isTempBrowserIssue = 
-      errMsg.includes('Protocol error') || 
+      errMsg.includes('protocol error') || 
       errMsg.includes('context was destroyed') || 
-      errMsg.includes('Session closed') ||
-      errMsg.includes('browser has already been closed') ||
-      errMsg.includes('Target closed') ||
-      errMsg.includes('Network.enable') ||
-      errMsg.includes('timed out') ||
-      errMsg.includes('timeout') ||
-      errMsg.includes('WebSocket') ||
-      errMsg.includes('closed') ||
-      errMsg.includes('disconnect') ||
-      errMsg.includes('stream error');
+      errMsg.includes('session closed') || 
+      errMsg.includes('browser has already been closed') || 
+      errMsg.includes('target closed') || 
+      errMsg.includes('network.enable') || 
+      errMsg.includes('timed out') || 
+      errMsg.includes('timeout') || 
+      errMsg.includes('websocket') || 
+      errMsg.includes('closed') || 
+      errMsg.includes('disconnect') || 
+      errMsg.includes('stream error') || 
+      errMsg.includes('connection');
+
 
     if (isTempBrowserIssue) {
       console.log(`Temporary connection issue detected, keeping message ${message.id} as pending to retry...`);
