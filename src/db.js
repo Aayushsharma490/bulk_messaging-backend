@@ -4,45 +4,75 @@ const path = require('path');
 const DB_DIR = path.join(__dirname, '..', 'data');
 const DB_FILE = path.join(DB_DIR, 'database.json');
 
+let dbCache = null;
+let isWriting = false;
+let pendingWriteData = null;
+
 // Initialize database with default empty structure if it doesn't exist
 async function initDb() {
   try {
     await fs.mkdir(DB_DIR, { recursive: true });
     try {
       await fs.access(DB_FILE);
+      // Load initial cache from file
+      const data = await fs.readFile(DB_FILE, 'utf8');
+      dbCache = JSON.parse(data);
     } catch {
-      const defaultDb = {
+      dbCache = {
         sessions: [],
         campaigns: [],
         messages: [],
         logs: []
       };
-      await writeDb(defaultDb);
+      await writeDb(dbCache);
     }
   } catch (err) {
     console.error('Error initializing database:', err);
   }
 }
 
-// Atomic file write to avoid corruption
+// Queue-based non-blocking background write to avoid corruption & event loop lag
 async function writeDb(data) {
-  const tempPath = `${DB_FILE}.tmp`;
-  try {
-    await fs.writeFile(tempPath, JSON.stringify(data, null, 2), 'utf8');
-    await fs.rename(tempPath, DB_FILE);
-  } catch (err) {
-    console.error('Failed to write database atomically:', err);
-    throw err;
+  dbCache = data; // Update cache immediately in memory
+  pendingWriteData = data;
+
+  if (isWriting) {
+    return; // Already writing, the active loop will pick up the updated data
   }
+
+  isWriting = true;
+
+  // Let the file write run in the background (asynchronously)
+  setImmediate(async () => {
+    try {
+      while (pendingWriteData !== null) {
+        const dataToWrite = pendingWriteData;
+        pendingWriteData = null; // Clear before starting write so we can detect new updates
+
+        const tempPath = `${DB_FILE}.tmp`;
+        await fs.writeFile(tempPath, JSON.stringify(dataToWrite, null, 2), 'utf8');
+        await fs.rename(tempPath, DB_FILE);
+      }
+    } catch (err) {
+      console.error('Failed to write database atomically in background:', err);
+    } finally {
+      isWriting = false;
+    }
+  });
 }
 
 async function readDb() {
+  if (dbCache) {
+    return dbCache;
+  }
   try {
     const data = await fs.readFile(DB_FILE, 'utf8');
-    return JSON.parse(data);
+    dbCache = JSON.parse(data);
+    return dbCache;
   } catch (err) {
     console.error('Failed to read database:', err);
-    return { sessions: [], campaigns: [], messages: [], logs: [] };
+    dbCache = { sessions: [], campaigns: [], messages: [], logs: [] };
+    return dbCache;
   }
 }
 
@@ -160,12 +190,12 @@ const db = {
       message
     };
     data.logs.push(newLog);
-    
+
     // Cap logs at 5000 entries total to keep file size reasonable
     if (data.logs.length > 5000) {
       data.logs.shift();
     }
-    
+
     await writeDb(data);
     return newLog;
   }

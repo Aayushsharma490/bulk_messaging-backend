@@ -73,7 +73,7 @@ async function startSession(sessionId) {
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      // Windows-friendly flags, prevents puppeteer launch issues
+      // Optimized flags for headless environments, prevents throttling and resource freezes
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -81,7 +81,12 @@ async function startSession(sessionId) {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+        '--disable-ipc-flooding-protection'
       ]
     }
   });
