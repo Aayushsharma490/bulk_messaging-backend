@@ -4,6 +4,23 @@ const { MessageMedia } = require('whatsapp-web.js');
 const fs = require('fs').promises;
 const path = require('path');
 
+// Helper to wrap promises with a timeout
+function withTimeout(promise, ms, errorMsg = 'Operation timed out') {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(errorMsg));
+    }, ms);
+  });
+  return Promise.race([
+    promise.then((res) => {
+      clearTimeout(timeoutId);
+      return res;
+    }),
+    timeoutPromise
+  ]);
+}
+
 let socketIo = null;
 let workerInterval = null;
 let isProcessing = false;
@@ -145,9 +162,9 @@ async function processQueue() {
 async function sendSingleMessage(campaign, message, client) {
   const campaignId = campaign.id;
   
-  // Set random delay: 5-15 seconds
+  // Set random delay: 5-10 seconds for faster sending
   const minDelay = campaign.minDelay || 5;
-  const maxDelay = campaign.maxDelay || 15;
+  const maxDelay = campaign.maxDelay || 10;
   const delaySeconds = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
 
   console.log(`Sending message ${message.id} to ${message.phoneNumber} in ${delaySeconds} seconds.`);
@@ -185,8 +202,13 @@ async function sendSingleMessage(campaign, message, client) {
       cleanNumber = `${cleanNumber}@c.us`;
     }
 
-    // 2. Validate WhatsApp registration
-    const isRegistered = await client.isRegisteredUser(cleanNumber);
+    // 2. Validate WhatsApp registration (Wrapped in 15s timeout to prevent hanging)
+    const isRegistered = await withTimeout(
+      client.isRegisteredUser(cleanNumber), 
+      15000, 
+      'WhatsApp check timed out'
+    );
+    
     if (!isRegistered) {
       await db.updateMessageStatus(message.id, 'failed', 'Invalid number (not registered on WhatsApp)');
       await db.addLog(campaignId, 'error', `Failed to send to ${message.name}: Number is not registered on WhatsApp.`);
@@ -211,7 +233,7 @@ async function sendSingleMessage(campaign, message, client) {
       }
     }
 
-    // 4. Send Message (with or without media)
+    // 4. Send Message (with or without media) - Wrapped in 25s/30s timeout to prevent hanging
     if (campaign.media && campaign.media.filename) {
       // Media path
       const mediaPath = path.join(__dirname, '..', 'uploads', campaign.media.filename);
@@ -220,13 +242,21 @@ async function sendSingleMessage(campaign, message, client) {
         const base64Data = fileBuffer.toString('base64');
         const media = new MessageMedia(campaign.media.mimeType, base64Data, campaign.media.filename);
         
-        await client.sendMessage(cleanNumber, media, { caption: formattedText });
+        await withTimeout(
+          client.sendMessage(cleanNumber, media, { caption: formattedText }),
+          30000,
+          'Media message send timed out'
+        );
       } catch (err) {
         console.error('Error reading/sending media:', err);
         throw new Error(`Media send failed: ${err.message}`);
       }
     } else {
-      await client.sendMessage(cleanNumber, formattedText);
+      await withTimeout(
+        client.sendMessage(cleanNumber, formattedText),
+        20000,
+        'Message send timed out'
+      );
     }
 
     // 5. Success Logging & Updates

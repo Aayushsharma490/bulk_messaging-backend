@@ -244,7 +244,7 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
       batchSize: 200, // Hardcoded safe batch size
       batchCooldown: 300, // Hardcoded 5 minutes cooldown
       minDelay: 5, // Hardcoded 5 seconds minimum delay
-      maxDelay: 15, // Hardcoded 15 seconds maximum delay (averages ~10s per message)
+      maxDelay: 10, // Hardcoded 10 seconds maximum delay (faster sending)
       media,
       totalContacts: processedContacts.length,
       createdAt: new Date().toISOString()
