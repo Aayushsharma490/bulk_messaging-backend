@@ -72,6 +72,7 @@ async function startSession(sessionId) {
     }),
     puppeteer: {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       // Windows-friendly flags, prevents puppeteer launch issues
       args: [
         '--no-sandbox',
