@@ -84,6 +84,7 @@ async function startSession(sessionId) {
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      protocolTimeout: 180000, // 3 minutes timeout to prevent CDP connection crashes under CPU load
       // Optimized flags for headless environments, prevents throttling and resource freezes
       args: [
         '--no-sandbox',
@@ -92,6 +93,7 @@ async function startSession(sessionId) {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
+        '--single-process', // Runs in a single process to reduce memory footprint on restricted containers
         '--disable-gpu',
         '--disable-extensions',
         '--disable-backgrounding-occluded-windows',
