@@ -200,33 +200,8 @@ async function sendSingleMessage(campaign, message, client) {
       cleanNumber = `${cleanNumber}@c.us`;
     }
 
-    // 2. Validate if number is registered on WhatsApp (essential to prevent Puppeteer hanging on unregistered numbers)
-    let targetJid = cleanNumber;
-    try {
-      const numberOnly = cleanNumber.split('@')[0];
-      const numberId = await withTimeout(
-        client.getNumberId(numberOnly),
-        15000,
-        'WhatsApp registration check timed out'
-      );
-      
-      if (!numberId) {
-        console.log(`Number ${numberOnly} is not registered on WhatsApp.`);
-        await db.updateMessageStatus(message.id, 'failed', 'Unregistered WhatsApp number');
-        await db.addLog(campaignId, 'error', `Failed to send to ${message.name || message.phoneNumber}: Number not registered on WhatsApp`);
-        
-        campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
-        await db.saveCampaign(campaign);
-        
-        emitToSocket('message_status', { messageId: message.id, status: 'failed', campaignId });
-        return;
-      }
-      
-      targetJid = numberId._serialized;
-    } catch (err) {
-      console.warn(`Registration check failed/timed out for ${message.phoneNumber}:`, err.message);
-      throw err;
-    }
+    // 2. Direct JID assignment (bypassing the unstable getNumberId check)
+    const targetJid = cleanNumber;
 
     // 3. Format message content
     // Personalized variables: Replace {name} or any custom field
