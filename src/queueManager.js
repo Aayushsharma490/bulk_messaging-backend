@@ -3,7 +3,7 @@ const sessionManager = require('./sessionManager');
 const fs = require('fs').promises;
 const path = require('path');
 
-// Helper to wrap promises with a timeout
+// ─── Helper: Wrap promise with a timeout ─────────────────────────────────────
 function withTimeout(promise, ms, errorMsg = 'Operation timed out') {
   let timeoutId;
   const timeoutPromise = new Promise((_, reject) => {
@@ -19,6 +19,13 @@ function withTimeout(promise, ms, errorMsg = 'Operation timed out') {
     timeoutPromise
   ]);
 }
+
+// ─── Anti-ban safety floors — must match routes.js SAFE_LIMITS ──────────────
+// Even if the DB has bad values (old campaigns), these floors protect the number.
+const ABSOLUTE_MIN_DELAY_SECONDS = 20;
+const ABSOLUTE_MAX_DELAY_SECONDS = 45;
+const ABSOLUTE_MAX_BATCH_SIZE = 50;
+const ABSOLUTE_MIN_BATCH_COOLDOWN_SECONDS = 15 * 60; // 15 minutes
 
 let socketIo = null;
 let workerInterval = null;
@@ -44,7 +51,7 @@ function emitToSocket(event, data) {
 function startWorker() {
   if (workerInterval) return;
   
-  // Check campaigns and process messages every 3 seconds
+  // Check campaigns every 5 seconds
   workerInterval = setInterval(async () => {
     if (isProcessing) return;
     isProcessing = true;
@@ -55,7 +62,7 @@ function startWorker() {
     } finally {
       isProcessing = false;
     }
-  }, 3000);
+  }, 5000);
   
   console.log('Campaign queue worker started.');
 }
@@ -91,14 +98,13 @@ async function processQueue() {
   // Find running campaigns
   const runningCampaigns = campaigns.filter(c => c.status === 'running');
   for (const campaign of runningCampaigns) {
-    // Check if campaign is in cooldown
+
+    // ── Cooldown check ──────────────────────────────────────────────────────
     if (campaign.cooldownUntil) {
       const cooldownTime = new Date(campaign.cooldownUntil);
       if (cooldownTime > now) {
-        // Still cooling down, skip
-        continue;
+        continue; // Still cooling down
       } else {
-        // Cooldown finished, remove flag and continue
         delete campaign.cooldownUntil;
         campaign.batchSentCount = 0;
         await db.saveCampaign(campaign);
@@ -107,7 +113,7 @@ async function processQueue() {
       }
     }
 
-    // Get client session
+    // ── Check client session ────────────────────────────────────────────────
     const sessionId = campaign.sessionId;
     const client = sessionManager.getClient(sessionId);
     const isReady = sessionManager.isClientReady(sessionId);
@@ -125,22 +131,20 @@ async function processQueue() {
         continue;
       }
       
-      // Temporary reconnect grace period (10 loops = 30 seconds max)
+      // Temporary reconnect grace period (10 loops = 50 seconds max)
       const retries = campaignReconnectRetries[campaign.id] || 0;
       if (retries < 10) {
         campaignReconnectRetries[campaign.id] = retries + 1;
         console.log(`Session ${sessionId} socket temporarily down. Grace retry ${retries + 1}/10 for campaign ${campaign.id}`);
-        
         if (retries === 0) {
           await db.addLog(campaign.id, 'info', `WhatsApp connection dropped. Attempting to auto-reconnect...`);
         }
-        continue; // Skip this worker loop tick to wait for reconnect
+        continue;
       } else {
-        // Exceeded grace period
         delete campaignReconnectRetries[campaign.id];
         campaign.status = 'paused';
         await db.saveCampaign(campaign);
-        await db.addLog(campaign.id, 'error', `Campaign paused: WhatsApp session "${session?.name || sessionId}" failed to reconnect within 30 seconds.`);
+        await db.addLog(campaign.id, 'error', `Campaign paused: WhatsApp session "${session?.name || sessionId}" failed to reconnect within 50 seconds.`);
         emitToSocket('campaign_update', campaign);
         continue;
       }
@@ -149,22 +153,28 @@ async function processQueue() {
     // Connection successful, reset retry counter
     delete campaignReconnectRetries[campaign.id];
 
-    // Get pending messages for this campaign
+    // ── Get pending messages ────────────────────────────────────────────────
     const messages = await db.getMessages(campaign.id);
     const pendingMessages = messages.filter(m => m.status === 'pending');
 
     if (pendingMessages.length === 0) {
-      // All messages processed
       campaign.status = 'completed';
       await db.saveCampaign(campaign);
-      await db.addLog(campaign.id, 'success', `Campaign completed successfully! All messages processed.`);
+      await db.addLog(campaign.id, 'success', `✅ Campaign completed successfully! All messages processed.`);
       emitToSocket('campaign_update', campaign);
       continue;
     }
 
-    // Check Batching logic
-    const batchSize = campaign.batchSize || 200;
-    const batchCooldown = campaign.batchCooldown || 300; // default 5 mins
+    // ── Enforce Anti-ban Batch Limits ───────────────────────────────────────
+    // Use server safe values — floor any bad values from old campaigns
+    const batchSize = Math.min(
+      campaign.batchSize || ABSOLUTE_MAX_BATCH_SIZE,
+      ABSOLUTE_MAX_BATCH_SIZE
+    );
+    const batchCooldown = Math.max(
+      campaign.batchCooldown || ABSOLUTE_MIN_BATCH_COOLDOWN_SECONDS,
+      ABSOLUTE_MIN_BATCH_COOLDOWN_SECONDS
+    );
     const sentInCurrentBatch = campaign.batchSentCount || 0;
 
     if (sentInCurrentBatch >= batchSize) {
@@ -173,39 +183,40 @@ async function processQueue() {
       await db.saveCampaign(campaign);
       
       const minutes = Math.round(batchCooldown / 60);
-      await db.addLog(campaign.id, 'info', `Batch limit of ${batchSize} reached. Cooling down for ${minutes} minutes to protect account...`);
+      await db.addLog(campaign.id, 'info', `🛡️ Batch limit of ${batchSize} reached. Cooling down for ${minutes} minutes to protect account from ban...`);
       emitToSocket('campaign_update', campaign);
       continue;
     }
 
-    // We take the next message to send
+    // ── Send next message ───────────────────────────────────────────────────
     const message = pendingMessages[0];
-    
-    // We start the sending process (runs asynchronously, but we only send ONE message per worker tick to respect delays)
-    // Wait, since we want to sleep between messages, let's run the send process for this message
     await sendSingleMessage(campaign, message, client);
-    break; // Only process one message per worker tick to prevent race conditions and overlapping loops
+    break; // One message per worker tick
   }
 }
 
-// Send a single message with individual delays and safety checks
+// ─── Send a single message with safe delays ──────────────────────────────────
 async function sendSingleMessage(campaign, message, client) {
   const campaignId = campaign.id;
-  
-  // Set random delay: 5-10 seconds for faster sending
-  const minDelay = campaign.minDelay || 5;
-  const maxDelay = campaign.maxDelay || 10;
+
+  // ⚠️ Enforce safe delay floors — never send faster than ABSOLUTE_MIN_DELAY_SECONDS
+  // Clamp min to floor, clamp max to ceiling, ensure max >= min
+  const minDelay = Math.max(campaign.minDelay || ABSOLUTE_MIN_DELAY_SECONDS, ABSOLUTE_MIN_DELAY_SECONDS);
+  const maxDelay = Math.max(
+    Math.max(campaign.maxDelay || ABSOLUTE_MAX_DELAY_SECONDS, ABSOLUTE_MAX_DELAY_SECONDS),
+    minDelay  // Ensure max is never less than min
+  );
+
   const delaySeconds = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
 
   console.log(`Sending message ${message.id} to ${message.phoneNumber} in ${delaySeconds} seconds.`);
-  await db.addLog(campaignId, 'info', `Preparing to send to ${message.name} (${message.phoneNumber}) in ${delaySeconds}s...`);
+  await db.addLog(campaignId, 'info', `⏳ Preparing to send to ${message.name || message.phoneNumber} in ${delaySeconds}s (anti-ban delay)...`);
 
-  // Interruptible sleep loop
+  // ── Interruptible sleep loop ────────────────────────────────────────────
   let interrupted = false;
   activeCampaignSleeps[campaignId] = true;
   
   for (let s = 0; s < delaySeconds; s++) {
-    // Check if campaign was paused or stopped
     const currentCampaign = await db.getCampaign(campaignId);
     if (!currentCampaign || currentCampaign.status !== 'running') {
       interrupted = true;
@@ -221,18 +232,20 @@ async function sendSingleMessage(campaign, message, client) {
     return;
   }
 
-  try {
-    // 1. Sanitize and format the phone number
-    let cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
-    
-    // Auto-prefix logic: ensure we have @s.whatsapp.net JID format for Baileys
-    let targetJid = cleanNumber;
-    if (!targetJid.endsWith('@s.whatsapp.net')) {
-      targetJid = `${targetJid}@s.whatsapp.net`;
-    }
+  // ── Re-check session is still alive before sending ──────────────────────
+  const isStillReady = sessionManager.isClientReady(campaign.sessionId);
+  if (!isStillReady) {
+    console.log(`Session dropped during sleep for message ${message.id}. Will retry next tick.`);
+    await db.addLog(campaignId, 'error', `Connection lost during delay. Message to ${message.name || message.phoneNumber} will be retried...`);
+    return;
+  }
 
-    // 3. Format message content
-    // Personalized variables: Replace {name} or any custom field
+  try {
+    // ── 1. Sanitize phone number ─────────────────────────────────────────
+    let cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
+    let targetJid = `${cleanNumber}@s.whatsapp.net`;
+
+    // ── 2. Personalize message content ───────────────────────────────────
     let formattedText = message.messageContent;
     formattedText = formattedText.replace(/{name}/gi, message.name || '');
     
@@ -243,9 +256,10 @@ async function sendSingleMessage(campaign, message, client) {
       }
     }
 
-    // 4. Send Message (with or without media) - Wrapped in safety timeouts
+    // ── 3. Send message (with or without media) ──────────────────────────
+    let sendResult;
+    
     if (campaign.media && campaign.media.filename) {
-      // Media path
       const mediaPath = path.join(__dirname, '..', 'uploads', campaign.media.filename);
       try {
         const fileBuffer = await fs.readFile(mediaPath);
@@ -260,7 +274,6 @@ async function sendSingleMessage(campaign, message, client) {
         } else if (mimeType.startsWith('audio/')) {
           mediaContent = { audio: fileBuffer, caption: formattedText };
         } else {
-          // Send as document
           mediaContent = { 
             document: fileBuffer, 
             mimetype: mimeType, 
@@ -269,7 +282,7 @@ async function sendSingleMessage(campaign, message, client) {
           };
         }
 
-        await withTimeout(
+        sendResult = await withTimeout(
           client.sendMessage(targetJid, mediaContent),
           60000,
           'Media message send timed out'
@@ -279,28 +292,35 @@ async function sendSingleMessage(campaign, message, client) {
         throw new Error(`Media send failed: ${err.message}`);
       }
     } else {
-      await withTimeout(
+      sendResult = await withTimeout(
         client.sendMessage(targetJid, { text: formattedText }),
-        25000,
+        30000,
         'Message send timed out'
       );
     }
 
-    // 5. Success Logging & Updates
+    // ── 4. Verify send result — only mark "sent" if Baileys confirmed it ──
+    // Baileys returns a proto message object on success; null/undefined means failure
+    if (!sendResult || !sendResult.key) {
+      throw new Error('Message was not acknowledged by WhatsApp (no message key returned). The number may not be on WhatsApp.');
+    }
+
+    // ── 5. Success: update DB ─────────────────────────────────────────────
     await db.updateMessageStatus(message.id, 'sent');
-    await db.addLog(campaignId, 'success', `Message sent to ${message.name} (${message.phoneNumber})`);
+    await db.addLog(campaignId, 'success', `✅ Message sent to ${message.name || message.phoneNumber} (${message.phoneNumber})`);
     
-    // Update batch counter
     campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
     await db.saveCampaign(campaign);
     
     emitToSocket('message_status', { messageId: message.id, status: 'sent', campaignId });
+
   } catch (err) {
     console.error(`Failed to send message ${message.id}:`, err);
     
-    // Check for temporary connection closed or WebSocket timeouts
     const errMsg = (err.message || '').toLowerCase();
-    const isTempBrowserIssue = 
+    
+    // ── Temporary connection issue — keep as pending to retry ────────────
+    const isTempConnectionIssue = 
       errMsg.includes('protocol error') || 
       errMsg.includes('context was destroyed') || 
       errMsg.includes('session closed') || 
@@ -310,21 +330,22 @@ async function sendSingleMessage(campaign, message, client) {
       errMsg.includes('timed out') || 
       errMsg.includes('timeout') || 
       errMsg.includes('websocket') || 
-      errMsg.includes('closed') || 
-      errMsg.includes('disconnect') || 
-      errMsg.includes('stream error') || 
-      errMsg.includes('connection');
+      errMsg.includes('stream error') ||
+      errMsg.includes('econnreset') ||
+      errMsg.includes('socket hang up') ||
+      errMsg.includes('disconnected') ||
+      errMsg.includes('connection reset') ||
+      errMsg.includes('write after end');
 
-
-    if (isTempBrowserIssue) {
-      console.log(`Temporary connection issue detected, keeping message ${message.id} as pending to retry...`);
-      await db.addLog(campaignId, 'error', `Connection hiccup: WhatsApp WebSocket was reset or timed out. Retrying send to ${message.name || message.phoneNumber} shortly...`);
-      // Return without updating DB status to failed, preserving it as pending
-      return;
+    if (isTempConnectionIssue) {
+      console.log(`Temporary connection issue, keeping message ${message.id} as pending to retry...`);
+      await db.addLog(campaignId, 'error', `⚠️ Connection hiccup when sending to ${message.name || message.phoneNumber}. Will retry shortly...`);
+      return; // Don't mark as failed — keep as pending for retry
     }
 
+    // ── Permanent failure — number not on WhatsApp or blocked ────────────
     await db.updateMessageStatus(message.id, 'failed', err.message || 'Unknown sending error');
-    await db.addLog(campaignId, 'error', `Failed to send to ${message.name}: ${err.message}`);
+    await db.addLog(campaignId, 'error', `❌ Failed to send to ${message.name || message.phoneNumber}: ${err.message}`);
     
     campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
     await db.saveCampaign(campaign);
@@ -333,7 +354,8 @@ async function sendSingleMessage(campaign, message, client) {
   }
 }
 
-// Pause campaign
+// ─── Campaign control functions ──────────────────────────────────────────────
+
 async function pauseCampaign(campaignId) {
   const campaign = await db.getCampaign(campaignId);
   if (campaign && campaign.status === 'running') {
@@ -344,29 +366,24 @@ async function pauseCampaign(campaignId) {
   }
 }
 
-// Resume campaign
 async function resumeCampaign(campaignId) {
   const campaign = await db.getCampaign(campaignId);
   if (campaign && (campaign.status === 'paused' || campaign.status === 'scheduled')) {
     campaign.status = 'running';
-    // Clear cooldown if resuming manually, resets batch count
     delete campaign.cooldownUntil;
     campaign.batchSentCount = 0;
-    
     await db.saveCampaign(campaign);
     await db.addLog(campaignId, 'info', `Campaign resumed by user.`);
     emitToSocket('campaign_update', campaign);
   }
 }
 
-// Stop campaign
 async function stopCampaign(campaignId) {
   const campaign = await db.getCampaign(campaignId);
   if (campaign) {
     campaign.status = 'stopped';
     delete campaign.cooldownUntil;
     
-    // Update all pending messages in this campaign to failed/cancelled
     const messages = await db.getMessages(campaignId);
     for (const msg of messages) {
       if (msg.status === 'pending') {

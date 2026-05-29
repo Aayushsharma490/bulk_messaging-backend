@@ -169,7 +169,12 @@ const db = {
     if (msg) {
       msg.status = status;
       if (error) msg.error = error;
-      msg.sentAt = new Date().toISOString();
+      // Only record sentAt for actually-sent messages; use updatedAt for failures
+      if (status === 'sent') {
+        msg.sentAt = new Date().toISOString();
+      } else {
+        msg.updatedAt = new Date().toISOString();
+      }
       await writeDb(data);
     }
     return msg;

@@ -7,7 +7,7 @@ const db = require('./db');
 const sessionManager = require('./sessionManager');
 const queueManager = require('./queueManager');
 
-// Configure Multer for file uploads
+// ─── Configure Multer for file uploads ──────────────────────────────────────
 const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
 
 const storage = multer.diskStorage({
@@ -30,7 +30,38 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 } // 15MB limit
 });
 
-// --- SESSIONS ---
+// ─── ANTI-BAN SAFETY LIMITS (Hardcoded — DO NOT LOWER THESE) ────────────────
+// These limits protect the client's WhatsApp number from getting banned.
+// WhatsApp's spam detection triggers on fast bulk senders.
+const SAFE_LIMITS = {
+  MIN_DELAY_SECONDS: 20,          // Minimum 20 seconds between messages
+  MAX_DELAY_SECONDS: 45,          // Maximum 45 seconds between messages
+  MAX_BATCH_SIZE: 50,             // Max 50 messages per batch (then cooldown kicks in)
+  MIN_BATCH_COOLDOWN_SECONDS: 15 * 60, // Minimum 15 minutes between batches
+};
+
+// ─── Admin Auth Middleware ───────────────────────────────────────────────────
+// Protects destructive admin routes with an API key.
+function requireAdminKey(req, res, next) {
+  const adminKey = process.env.ADMIN_API_KEY;
+  
+  // If no admin key is configured on the server, allow (dev mode)
+  if (!adminKey) {
+    return next();
+  }
+
+  const providedKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  if (!providedKey || providedKey !== adminKey) {
+    return res.status(403).json({
+      error: 'Forbidden: Valid admin API key required. Provide it in the x-api-key header.'
+    });
+  }
+  
+  next();
+}
+
+// ─── SESSIONS ────────────────────────────────────────────────────────────────
 
 // Get all sessions
 router.get('/sessions', async (req, res) => {
@@ -53,8 +84,11 @@ router.post('/sessions', async (req, res) => {
     const sessionId = 'session_' + Math.random().toString(36).substring(2, 9);
     await sessionManager.startSession(sessionId);
     
-    // Update name
+    // Update name — guard against rare race condition where session isn't saved yet
     const session = await db.getSession(sessionId);
+    if (!session) {
+      return res.status(500).json({ error: 'Session was created but could not be retrieved. Please refresh.' });
+    }
     session.name = name;
     await db.saveSession(session);
 
@@ -90,7 +124,7 @@ router.delete('/sessions/:id', async (req, res) => {
   }
 });
 
-// --- CAMPAIGNS ---
+// ─── CAMPAIGNS ───────────────────────────────────────────────────────────────
 
 // Get all campaigns with statistics loaded
 router.get('/campaigns', async (req, res) => {
@@ -153,13 +187,9 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
       name, 
       sessionId, 
       messageMode, 
-      templatesJson, // stringified array of template messages
-      scheduledAt, // ISO string or empty
-      batchSize,
-      batchCooldown,
-      minDelay,
-      maxDelay,
-      contactsJson // stringified array of { name, phone, customFields }
+      templatesJson,
+      scheduledAt,
+      contactsJson
     } = req.body;
 
     if (!name || !sessionId || !messageMode || !templatesJson || !contactsJson) {
@@ -200,13 +230,11 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
     for (const contact of rawContacts) {
       if (!contact.phone) continue;
       
-      // Smart sanitize: remove separator characters (spaces, hyphens, parentheses), then extract leading digits
       let phoneStr = contact.phone.toString().replace(/[\s\-\(\)]+/g, '');
       const match = phoneStr.match(/^\+?[0-9]+/);
       let cleanPhone = match ? match[0].replace(/[^0-9]/g, '') : phoneStr.replace(/[^0-9]/g, '');
-      if (cleanPhone.length < 8) continue; // invalid number filter: must be at least 8 digits
+      if (cleanPhone.length < 8) continue;
 
-      // Remove duplicates
       if (numbersSeen.has(cleanPhone)) continue;
       numbersSeen.add(cleanPhone);
 
@@ -234,7 +262,9 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
     const campaignId = 'camp_' + Math.random().toString(36).substring(2, 9);
     const isScheduled = !!scheduledAt;
 
-    // 3. Create campaign object (Safety limits hardcoded on backend)
+    // 3. Create campaign object
+    // ⚠️  ANTI-BAN: All safety limits are ENFORCED on the server side.
+    //     The frontend values are ignored — safe limits are hardcoded here.
     const campaign = {
       id: campaignId,
       name,
@@ -243,23 +273,22 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
       templates,
       status: isScheduled ? 'scheduled' : 'running',
       scheduledAt: isScheduled ? scheduledAt : null,
-      batchSize: 200, // Hardcoded safe batch size
-      batchCooldown: 300, // Hardcoded 5 minutes cooldown
-      minDelay: 5, // Hardcoded 5 seconds minimum delay
-      maxDelay: 10, // Hardcoded 10 seconds maximum delay (faster sending)
+      batchSize: SAFE_LIMITS.MAX_BATCH_SIZE,               // Max 50 per batch
+      batchCooldown: SAFE_LIMITS.MIN_BATCH_COOLDOWN_SECONDS, // 15 min cooldown
+      minDelay: SAFE_LIMITS.MIN_DELAY_SECONDS,             // 20 seconds min
+      maxDelay: SAFE_LIMITS.MAX_DELAY_SECONDS,             // 45 seconds max
       media,
       totalContacts: processedContacts.length,
+      batchSentCount: 0,
       createdAt: new Date().toISOString()
     };
 
     // 4. Generate messages to queue
     const queuedMessages = processedContacts.map((contact, index) => {
-      // Pick message content (random variation, or first variation if Common/Personalized)
       let messageContent = '';
       if (templates.length === 1) {
         messageContent = templates[0];
       } else {
-        // Randomly pick a variation template for each contact
         const randomIndex = Math.floor(Math.random() * templates.length);
         messageContent = templates[randomIndex];
       }
@@ -276,12 +305,14 @@ router.post('/campaigns', upload.single('mediaFile'), async (req, res) => {
       };
     });
 
-    // 5. Save database
+    // 5. Save to database
     await db.saveCampaign(campaign);
     await db.saveMessages(queuedMessages);
     
     // Add logs
     await db.addLog(campaignId, 'info', `Campaign created with ${processedContacts.length} unique contacts. Duplicate/invalid numbers filtered: ${rawContacts.length - processedContacts.length}.`);
+    await db.addLog(campaignId, 'info', `🛡️ Anti-ban limits active: ${SAFE_LIMITS.MIN_DELAY_SECONDS}–${SAFE_LIMITS.MAX_DELAY_SECONDS}s delay, batch of ${SAFE_LIMITS.MAX_BATCH_SIZE}, ${SAFE_LIMITS.MIN_BATCH_COOLDOWN_SECONDS / 60}min cooldown between batches.`);
+    
     if (isScheduled) {
       await db.addLog(campaignId, 'info', `Campaign scheduled to start at ${new Date(scheduledAt).toLocaleString()}.`);
     } else {
@@ -349,7 +380,6 @@ router.get('/campaigns/:id/messages', async (req, res) => {
 router.get('/campaigns/:id/logs', async (req, res) => {
   try {
     const logs = await db.getLogs(req.params.id);
-    // Sort oldest first for terminal stream
     logs.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     res.json(logs);
   } catch (err) {
@@ -357,7 +387,7 @@ router.get('/campaigns/:id/logs', async (req, res) => {
   }
 });
 
-// Helper for file extensions to MIME type conversion
+// ─── Helper: File extension → MIME type ─────────────────────────────────────
 function fileMimeType(filename) {
   const ext = path.extname(filename).toLowerCase();
   const mimeTypes = {
@@ -365,6 +395,7 @@ function fileMimeType(filename) {
     '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg',
     '.gif': 'image/gif',
+    '.mp4': 'video/mp4',
     '.pdf': 'application/pdf',
     '.doc': 'application/msword',
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -376,9 +407,9 @@ function fileMimeType(filename) {
   return mimeTypes[ext];
 }
 
-// --- ADMIN RESET ROUTE ---
-// Reset database (clear campaigns, messages, logs but keep active sessions)
-router.get('/admin/reset', async (req, res) => {
+// ─── ADMIN RESET ROUTE (PROTECTED) ──────────────────────────────────────────
+// Requires x-api-key header matching ADMIN_API_KEY in .env
+router.get('/admin/reset', requireAdminKey, async (req, res) => {
   try {
     await db.resetDb();
     res.send('<h1>Database Reset Successful</h1><p>All campaigns, messages, and logs have been cleared. Connected sessions remain active.</p>');
@@ -387,13 +418,23 @@ router.get('/admin/reset', async (req, res) => {
   }
 });
 
-router.post('/admin/reset', async (req, res) => {
+router.post('/admin/reset', requireAdminKey, async (req, res) => {
   try {
     await db.resetDb();
     res.json({ success: true, message: 'Database reset successfully (campaigns, messages, and logs cleared).' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Get current anti-ban limits (for frontend display)
+router.get('/config/limits', (req, res) => {
+  res.json({
+    minDelay: SAFE_LIMITS.MIN_DELAY_SECONDS,
+    maxDelay: SAFE_LIMITS.MAX_DELAY_SECONDS,
+    batchSize: SAFE_LIMITS.MAX_BATCH_SIZE,
+    batchCooldownMinutes: SAFE_LIMITS.MIN_BATCH_COOLDOWN_SECONDS / 60
+  });
 });
 
 module.exports = router;
