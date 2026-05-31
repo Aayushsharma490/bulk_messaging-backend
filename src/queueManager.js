@@ -195,27 +195,51 @@ async function processQueue() {
   }
 }
 
-// ─── Send a single message with safe delays ──────────────────────────────────
+// ─── Human-Like Delay Generator ──────────────────────────────────────────────
+// Uses weighted random tiers to mimic real human sending patterns.
+// Humans are NOT consistent — they sometimes reply fast, sometimes slow.
+// A bot with fixed delays is trivially detectable by WhatsApp's AI.
+function generateHumanDelay(hasMedia) {
+  const rand = Math.random();
+  let delaySeconds;
+
+  if (hasMedia) {
+    // Media takes longer to "look at" — shift all tiers up
+    if (rand < 0.55)      delaySeconds = 20 + Math.floor(Math.random() * 15); // 20–35s (55%)
+    else if (rand < 0.85) delaySeconds = 35 + Math.floor(Math.random() * 20); // 35–55s (30%)
+    else                  delaySeconds = 70 + Math.floor(Math.random() * 60); // 70–130s (15%)
+  } else {
+    // Text-only messages
+    if (rand < 0.60)      delaySeconds = 12 + Math.floor(Math.random() * 14); // 12–26s (60%)
+    else if (rand < 0.90) delaySeconds = 26 + Math.floor(Math.random() * 20); // 26–46s (30%)
+    else                  delaySeconds = 60 + Math.floor(Math.random() * 70); // 60–130s (10%)
+  }
+
+  // Absolute floor: never go below 12 seconds no matter what
+  return Math.max(delaySeconds, 12);
+}
+
+// ─── Send a single message with human-like behavior ──────────────────────────
 async function sendSingleMessage(campaign, message, client) {
   const campaignId = campaign.id;
+  const hasMedia = !!(campaign.media && campaign.media.filename);
 
-  // ⚠️ Enforce safe delay floors — never send faster than ABSOLUTE_MIN_DELAY_SECONDS
-  // Clamp min to floor, clamp max to ceiling, ensure max >= min
-  const minDelay = Math.max(campaign.minDelay || ABSOLUTE_MIN_DELAY_SECONDS, ABSOLUTE_MIN_DELAY_SECONDS);
-  const maxDelay = Math.max(
-    Math.max(campaign.maxDelay || ABSOLUTE_MAX_DELAY_SECONDS, ABSOLUTE_MAX_DELAY_SECONDS),
-    minDelay  // Ensure max is never less than min
-  );
+  // ── Generate human-like delay ────────────────────────────────────────────
+  const delaySeconds = generateHumanDelay(hasMedia);
 
-  const delaySeconds = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+  console.log(`Sending message ${message.id} to ${message.phoneNumber} in ${delaySeconds}s.`);
+  await db.addLog(campaignId, 'info', `⏳ Next message to ${message.name || message.phoneNumber} in ${delaySeconds}s...`);
 
-  console.log(`Sending message ${message.id} to ${message.phoneNumber} in ${delaySeconds} seconds.`);
-  await db.addLog(campaignId, 'info', `⏳ Preparing to send to ${message.name || message.phoneNumber} in ${delaySeconds}s (anti-ban delay)...`);
+  // ── Night-hour warning (11 PM – 7 AM) ────────────────────────────────────
+  const hour = new Date().getHours();
+  if (hour >= 23 || hour < 7) {
+    await db.addLog(campaignId, 'info', `⚠️ Sending at night (${hour}:00). Higher ban risk — consider pausing and resuming in morning.`);
+  }
 
-  // ── Interruptible sleep loop ────────────────────────────────────────────
+  // ── Interruptible sleep loop ──────────────────────────────────────────────
   let interrupted = false;
   activeCampaignSleeps[campaignId] = true;
-  
+
   for (let s = 0; s < delaySeconds; s++) {
     const currentCampaign = await db.getCampaign(campaignId);
     if (!currentCampaign || currentCampaign.status !== 'running') {
@@ -224,7 +248,7 @@ async function sendSingleMessage(campaign, message, client) {
     }
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
-  
+
   delete activeCampaignSleeps[campaignId];
 
   if (interrupted) {
@@ -232,23 +256,22 @@ async function sendSingleMessage(campaign, message, client) {
     return;
   }
 
-  // ── Re-check session is still alive before sending ──────────────────────
+  // ── Re-check session is still alive after sleep ───────────────────────────
   const isStillReady = sessionManager.isClientReady(campaign.sessionId);
   if (!isStillReady) {
     console.log(`Session dropped during sleep for message ${message.id}. Will retry next tick.`);
-    await db.addLog(campaignId, 'error', `Connection lost during delay. Message to ${message.name || message.phoneNumber} will be retried...`);
+    await db.addLog(campaignId, 'error', `Connection lost during delay. Will retry...`);
     return;
   }
 
   try {
-    // ── 1. Sanitize phone number ─────────────────────────────────────────
-    let cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
-    let targetJid = `${cleanNumber}@s.whatsapp.net`;
+    // ── 1. Sanitize phone number ──────────────────────────────────────────
+    const cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
+    const targetJid = `${cleanNumber}@s.whatsapp.net`;
 
-    // ── 2. Personalize message content ───────────────────────────────────
+    // ── 2. Personalize message ────────────────────────────────────────────
     let formattedText = message.messageContent;
     formattedText = formattedText.replace(/{name}/gi, message.name || '');
-    
     if (message.customFields) {
       for (const [key, val] of Object.entries(message.customFields)) {
         const regex = new RegExp(`{${key}}`, 'gi');
@@ -256,17 +279,30 @@ async function sendSingleMessage(campaign, message, client) {
       }
     }
 
-    // ── 3. Send message (with or without media) ──────────────────────────
+    // ── 3. Simulate typing indicator (HUMAN BEHAVIOR) ─────────────────────
+    // This shows the recipient a "typing..." bubble before the message arrives.
+    // Real humans type before sending — bots don't. This reduces spam detection.
+    try {
+      await client.sendPresenceUpdate('composing', targetJid);
+      // Typing duration: proportional to message length, capped at 6 seconds
+      const typingMs = Math.min(2000 + Math.floor(formattedText.length * 30), 6000);
+      await new Promise(resolve => setTimeout(resolve, typingMs));
+      await client.sendPresenceUpdate('paused', targetJid);
+    } catch (presenceErr) {
+      // Non-fatal — continue even if presence update fails
+      console.warn(`Presence update failed for ${targetJid} (non-fatal):`, presenceErr.message);
+    }
+
+    // ── 4. Send message (text or media) ──────────────────────────────────
     let sendResult;
-    
-    if (campaign.media && campaign.media.filename) {
+
+    if (hasMedia) {
       const mediaPath = path.join(__dirname, '..', 'uploads', campaign.media.filename);
       try {
         const fileBuffer = await fs.readFile(mediaPath);
-        
-        let mediaContent;
         const mimeType = campaign.media.mimeType || '';
-        
+        let mediaContent;
+
         if (mimeType.startsWith('image/')) {
           mediaContent = { image: fileBuffer, caption: formattedText };
         } else if (mimeType.startsWith('video/')) {
@@ -274,11 +310,11 @@ async function sendSingleMessage(campaign, message, client) {
         } else if (mimeType.startsWith('audio/')) {
           mediaContent = { audio: fileBuffer, caption: formattedText };
         } else {
-          mediaContent = { 
-            document: fileBuffer, 
-            mimetype: mimeType, 
-            fileName: campaign.media.originalName || campaign.media.filename, 
-            caption: formattedText 
+          mediaContent = {
+            document: fileBuffer,
+            mimetype: mimeType,
+            fileName: campaign.media.originalName || campaign.media.filename,
+            caption: formattedText
           };
         }
 
@@ -299,62 +335,55 @@ async function sendSingleMessage(campaign, message, client) {
       );
     }
 
-    // ── 4. Verify send result — only mark "sent" if Baileys confirmed it ──
-    // Baileys returns a proto message object on success; null/undefined means failure
+    // ── 5. Verify Baileys confirmation ────────────────────────────────────
     if (!sendResult || !sendResult.key) {
-      throw new Error('Message was not acknowledged by WhatsApp (no message key returned). The number may not be on WhatsApp.');
+      throw new Error('No delivery receipt from WhatsApp. Number may not be on WhatsApp.');
     }
 
-    // ── 5. Success: update DB ─────────────────────────────────────────────
+    // ── 6. Success ────────────────────────────────────────────────────────
     await db.updateMessageStatus(message.id, 'sent');
-    await db.addLog(campaignId, 'success', `✅ Message sent to ${message.name || message.phoneNumber} (${message.phoneNumber})`);
-    
+    await db.addLog(campaignId, 'success', `✅ Sent to ${message.name || message.phoneNumber} (${message.phoneNumber})`);
+
     campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
     await db.saveCampaign(campaign);
-    
     emitToSocket('message_status', { messageId: message.id, status: 'sent', campaignId });
 
   } catch (err) {
     console.error(`Failed to send message ${message.id}:`, err);
-    
     const errMsg = (err.message || '').toLowerCase();
-    
-    // ── Temporary connection issue — keep as pending to retry ────────────
-    const isTempConnectionIssue = 
-      errMsg.includes('protocol error') || 
-      errMsg.includes('context was destroyed') || 
-      errMsg.includes('session closed') || 
-      errMsg.includes('browser has already been closed') || 
-      errMsg.includes('target closed') || 
-      errMsg.includes('network.enable') || 
-      errMsg.includes('timed out') || 
-      errMsg.includes('timeout') || 
-      errMsg.includes('websocket') || 
+
+    // Temporary — keep as pending and retry
+    const isTemp =
+      errMsg.includes('protocol error') ||
+      errMsg.includes('context was destroyed') ||
+      errMsg.includes('session closed') ||
+      errMsg.includes('timed out') ||
+      errMsg.includes('timeout') ||
+      errMsg.includes('websocket') ||
       errMsg.includes('stream error') ||
       errMsg.includes('econnreset') ||
       errMsg.includes('socket hang up') ||
       errMsg.includes('disconnected') ||
       errMsg.includes('connection reset') ||
-      errMsg.includes('write after end');
+      errMsg.includes('write after end') ||
+      errMsg.includes('network');
 
-    if (isTempConnectionIssue) {
-      console.log(`Temporary connection issue, keeping message ${message.id} as pending to retry...`);
-      await db.addLog(campaignId, 'error', `⚠️ Connection hiccup when sending to ${message.name || message.phoneNumber}. Will retry shortly...`);
-      return; // Don't mark as failed — keep as pending for retry
+    if (isTemp) {
+      await db.addLog(campaignId, 'error', `⚠️ Connection hiccup sending to ${message.name || message.phoneNumber}. Will retry shortly...`);
+      return;
     }
 
-    // ── Permanent failure — number not on WhatsApp or blocked ────────────
-    await db.updateMessageStatus(message.id, 'failed', err.message || 'Unknown sending error');
-    await db.addLog(campaignId, 'error', `❌ Failed to send to ${message.name || message.phoneNumber}: ${err.message}`);
-    
+    // Permanent failure
+    await db.updateMessageStatus(message.id, 'failed', err.message || 'Unknown error');
+    await db.addLog(campaignId, 'error', `❌ Failed: ${message.name || message.phoneNumber} — ${err.message}`);
     campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
     await db.saveCampaign(campaign);
-    
     emitToSocket('message_status', { messageId: message.id, status: 'failed', campaignId });
   }
 }
 
 // ─── Campaign control functions ──────────────────────────────────────────────
+
 
 async function pauseCampaign(campaignId) {
   const campaign = await db.getCampaign(campaignId);
