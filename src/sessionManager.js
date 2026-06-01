@@ -6,6 +6,14 @@ const path = require('path');
 const fs = require('fs').promises;
 const db = require('./db');
 
+// Lazy-import queueManager to avoid circular dependency
+// (queueManager also requires sessionManager)
+let queueManager = null;
+function getQueueManager() {
+  if (!queueManager) queueManager = require('./queueManager');
+  return queueManager;
+}
+
 const clients = {};
 let socketIo = null;
 
@@ -95,6 +103,27 @@ async function startSession(sessionId) {
 
     // Save credentials whenever they are updated
     sock.ev.on('creds.update', saveCreds);
+
+    // ── messages.update: Track real WhatsApp delivery ACKs ────────────────
+    // Fires when WA updates a sent message's status:
+    //   ack 1 = reached WA server (1 grey tick)
+    //   ack 2 = delivered to recipient's phone (2 grey ticks)
+    //   ack 3 = read by recipient (2 blue ticks)
+    //   ack -1 = server rejected (likely spam filtering)
+    sock.ev.on('messages.update', async (updates) => {
+      try {
+        const qm = getQueueManager();
+        for (const update of updates) {
+          if (update.update && update.update.status !== undefined) {
+            const baileysKey = JSON.stringify(update.key);
+            const ack = update.update.status;
+            await qm.handleMessageAck(baileysKey, ack);
+          }
+        }
+      } catch (err) {
+        console.error('Error processing message ACK update:', err);
+      }
+    });
 
     // Connection updates (including QR code emission and login status)
     sock.ev.on('connection.update', async (update) => {

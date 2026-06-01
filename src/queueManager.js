@@ -37,6 +37,36 @@ const activeCampaignSleeps = {};
 // Track reconnect retry count per running campaign
 const campaignReconnectRetries = {};
 
+// Map of Baileys message key → {campaignId, messageId}
+// Used by sessionManager's messages.update listener to track real delivery ACK
+const sentKeyMap = {};
+
+// Called by sessionManager when WhatsApp ACKs a message
+// ack: 1 = sent to WA server (1 tick), 2 = delivered to device (2 ticks), 3 = read (blue ticks)
+async function handleMessageAck(baileysKey, ack) {
+  const entry = sentKeyMap[baileysKey];
+  if (!entry) return;
+
+  const { campaignId, messageId } = entry;
+
+  if (ack >= 2) {
+    // Actually delivered to the recipient's phone
+    await db.updateMessageStatus(messageId, 'sent');
+    await db.addLog(campaignId, 'success', `✅ Delivered (confirmed by WhatsApp) to message ID ${messageId}`);
+    emitToSocket('message_ack', { messageId, ack, campaignId, status: 'delivered' });
+    delete sentKeyMap[baileysKey]; // cleanup
+  } else if (ack === 1) {
+    // Reached WA server but not yet to device (transient, we wait for ack 2)
+    emitToSocket('message_ack', { messageId, ack, campaignId, status: 'server_ack' });
+  } else if (ack < 0) {
+    // Failed at server level
+    await db.updateMessageStatus(messageId, 'failed', 'WhatsApp server rejected the message (server-level failure)');
+    await db.addLog(campaignId, 'error', `❌ WhatsApp SERVER rejected message to ${messageId}. This may indicate spam filtering.`);
+    emitToSocket('message_ack', { messageId, ack, campaignId, status: 'failed' });
+    delete sentKeyMap[baileysKey];
+  }
+}
+
 function setSocketIo(io) {
   socketIo = io;
 }
@@ -267,9 +297,38 @@ async function sendSingleMessage(campaign, message, client) {
   try {
     // ── 1. Sanitize phone number ──────────────────────────────────────────
     const cleanNumber = message.phoneNumber.replace(/[^0-9]/g, '');
-    const targetJid = `${cleanNumber}@s.whatsapp.net`;
+    let targetJid = `${cleanNumber}@s.whatsapp.net`;
 
-    // ── 2. Personalize message ────────────────────────────────────────────
+    // ── 2. Pre-check: verify this number is registered on WhatsApp ────────
+    // Baileys sendMessage() returns a local key even for non-WA numbers.
+    // Without this check, we get fake 'sent' logs for numbers not on WhatsApp.
+    try {
+      const waCheckResults = await withTimeout(
+        client.onWhatsApp(cleanNumber),
+        10000,
+        'WhatsApp registration check timed out'
+      );
+      const waResult = Array.isArray(waCheckResults) ? waCheckResults[0] : waCheckResults;
+
+      if (!waResult || !waResult.exists) {
+        throw new Error('Number is not registered on WhatsApp');
+      }
+
+      // Use the canonical JID returned by WhatsApp if available
+      if (waResult.jid) {
+        targetJid = waResult.jid;
+      }
+    } catch (checkErr) {
+      if (checkErr.message === 'Number is not registered on WhatsApp') {
+        // Permanent failure — number genuinely not on WA
+        throw checkErr;
+      }
+      // Network/timeout error on the check itself — proceed and try sending anyway
+      console.warn(`WA registration check failed (network issue), proceeding with send:`, checkErr.message);
+      await db.addLog(campaignId, 'info', `⚠️ Could not pre-verify number ${message.phoneNumber} (network). Attempting send anyway...`);
+    }
+
+    // ── 3. Personalize message ────────────────────────────────────────────
     let formattedText = message.messageContent;
     formattedText = formattedText.replace(/{name}/gi, message.name || '');
     if (message.customFields) {
@@ -340,9 +399,20 @@ async function sendSingleMessage(campaign, message, client) {
       throw new Error('No delivery receipt from WhatsApp. Number may not be on WhatsApp.');
     }
 
-    // ── 6. Success ────────────────────────────────────────────────────────
+    // ── 6. Register key for ACK tracking ─────────────────────────────────
+    // Store the Baileys message key so sessionManager's messages.update
+    // listener can update the status when WhatsApp actually delivers the message.
+    const baileysKey = JSON.stringify(sendResult.key);
+    sentKeyMap[baileysKey] = { campaignId, messageId: message.id };
+
+    // Clean up stale keys after 5 minutes (in case ACK never arrives)
+    setTimeout(() => {
+      delete sentKeyMap[baileysKey];
+    }, 5 * 60 * 1000);
+
+    // ── 7. Success ────────────────────────────────────────────────────────
     await db.updateMessageStatus(message.id, 'sent');
-    await db.addLog(campaignId, 'success', `✅ Sent to ${message.name || message.phoneNumber} (${message.phoneNumber})`);
+    await db.addLog(campaignId, 'success', `✅ Sent to ${message.name || message.phoneNumber} (${message.phoneNumber}) — waiting for delivery confirmation...`);
 
     campaign.batchSentCount = (campaign.batchSentCount || 0) + 1;
     await db.saveCampaign(campaign);
@@ -432,5 +502,7 @@ module.exports = {
   stopWorker,
   pauseCampaign,
   resumeCampaign,
-  stopCampaign
+  stopCampaign,
+  handleMessageAck,  // called by sessionManager for WhatsApp delivery ACKs
+  sentKeyMap         // exposed for reference / debugging
 };
