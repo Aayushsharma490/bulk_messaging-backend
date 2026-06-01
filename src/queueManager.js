@@ -41,6 +41,9 @@ const campaignReconnectRetries = {};
 // Used by sessionManager's messages.update listener to track real delivery ACK
 const sentKeyMap = {};
 
+// Track consecutive unconfirmed messages (soft ban detection)
+const softBanTracker = {};
+
 // Called by sessionManager when WhatsApp ACKs a message
 // ack: 1 = sent to WA server (1 tick), 2 = delivered to device (2 ticks), 3 = read (blue ticks)
 async function handleMessageAck(baileysKey, ack) {
@@ -399,16 +402,58 @@ async function sendSingleMessage(campaign, message, client) {
       throw new Error('No delivery receipt from WhatsApp. Number may not be on WhatsApp.');
     }
 
-    // ── 6. Register key for ACK tracking ─────────────────────────────────
+    // ── 6. Register key for ACK tracking + delivery timeout watchdog ─────
     // Store the Baileys message key so sessionManager's messages.update
-    // listener can update the status when WhatsApp actually delivers the message.
+    // listener can update the status when WhatsApp actually delivers.
     const baileysKey = JSON.stringify(sendResult.key);
     sentKeyMap[baileysKey] = { campaignId, messageId: message.id };
 
-    // Clean up stale keys after 5 minutes (in case ACK never arrives)
-    setTimeout(() => {
+    // Delivery timeout watchdog: if WA doesn't send ACK within 5 minutes,
+    // the message was silently dropped (soft-ban / shadow-ban symptom).
+    // Track consecutive unconfirmed messages per campaign.
+    if (!softBanTracker[campaignId]) {
+      softBanTracker[campaignId] = { unconfirmedCount: 0 };
+    }
+
+    setTimeout(async () => {
+      const stillPending = sentKeyMap[baileysKey]; // if still here, no ACK came
       delete sentKeyMap[baileysKey];
-    }, 5 * 60 * 1000);
+
+      if (stillPending) {
+        softBanTracker[campaignId] = softBanTracker[campaignId] || { unconfirmedCount: 0 };
+        softBanTracker[campaignId].unconfirmedCount++;
+        const unconfirmed = softBanTracker[campaignId].unconfirmedCount;
+
+        await db.addLog(campaignId, 'error',
+          `⚠️ No delivery confirmation from WhatsApp for message to ${message.name || message.phoneNumber} after 5 minutes. ` +
+          `(${unconfirmed} consecutive unconfirmed) — WhatsApp may be silently dropping messages.`
+        );
+        emitToSocket('delivery_warning', { campaignId, unconfirmedCount: unconfirmed, messageId: message.id });
+
+        // After 5 consecutive unconfirmed messages, auto-pause and fire CRITICAL alert
+        if (unconfirmed >= 5) {
+          const currentCampaign = await db.getCampaign(campaignId);
+          if (currentCampaign && currentCampaign.status === 'running') {
+            currentCampaign.status = 'paused';
+            await db.saveCampaign(currentCampaign);
+            await db.addLog(campaignId, 'error',
+              `🚨 CRITICAL: Campaign AUTO-PAUSED. 5+ messages sent with ZERO delivery confirmation from WhatsApp. ` +
+              `This strongly indicates your WhatsApp account has been SOFT-BANNED (shadow banned). ` +
+              `Messages appear sent but are silently dropped by WhatsApp's servers. ` +
+              `ACTION REQUIRED: Stop this campaign. Rest this number for 7+ days or use a fresh number.`
+            );
+            emitToSocket('campaign_update', currentCampaign);
+            emitToSocket('soft_ban_detected', { campaignId });
+            softBanTracker[campaignId].unconfirmedCount = 0; // Reset after pause
+          }
+        }
+      } else {
+        // ACK arrived — reset the unconfirmed counter (things are working)
+        if (softBanTracker[campaignId]) {
+          softBanTracker[campaignId].unconfirmedCount = 0;
+        }
+      }
+    }, 5 * 60 * 1000); // 5-minute watchdog
 
     // ── 7. Success ────────────────────────────────────────────────────────
     await db.updateMessageStatus(message.id, 'sent');
